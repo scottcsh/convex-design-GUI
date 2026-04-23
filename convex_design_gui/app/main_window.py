@@ -1283,58 +1283,112 @@ set +o pipefail
 find "${{FIVE_HCS_EXTRACTED_DIR}}" -maxdepth 4 -type f | head -30
 set -o pipefail
 
+CACHE_PARENT="${{FIVE_HCS_EXTRACTED_DIR}}/.convex_design_gui_cache"
+if mkdir -p "${{CACHE_PARENT}}" 2>/dev/null; then
+  CACHE_DIR="${{CACHE_PARENT}}"
+else
+  CACHE_KEY="$(printf '%s' "${{FIVE_HCS_EXTRACTED_DIR}}" | cksum | awk '{{print $1}}')"
+  CACHE_DIR="${{HOME}}/.cache/convex_design_gui/5hcs_${{CACHE_KEY}}"
+  mkdir -p "${{CACHE_DIR}}"
+fi
+SCAFFOLD_INDEX="${{CACHE_DIR}}/5hcs_scaffold_lengths.tsv"
+
+if [[ "${{REBUILD_HCS_INDEX:-0}}" == "1" ]]; then
+  rm -f "${{SCAFFOLD_INDEX}}"
+fi
+
+if [[ ! -s "${{SCAFFOLD_INDEX}}" ]]; then
+  echo "Building 5HCS scaffold length index: ${{SCAFFOLD_INDEX}}"
+  index_tmp="${{SCAFFOLD_INDEX}}.tmp.$$"
+  indexed_count=0
+  while IFS= read -r -d '' scaffold_path; do
+    lower_path="$(echo "${{scaffold_path}}" | tr '[:upper:]' '[:lower:]')"
+    if [[ "${{lower_path}}" == *.gz ]]; then
+      residue_count="$(
+        gzip -cd "${{scaffold_path}}" | awk '
+          $1 == "ATOM" && $3 == "CA" {{
+            key = $5 ":" $6
+            seen[key] = 1
+          }}
+          END {{
+            count = 0
+            for (key in seen) {{
+              count++
+            }}
+            print count
+          }}
+        '
+      )"
+    else
+      residue_count="$(
+        awk '
+          $1 == "ATOM" && $3 == "CA" {{
+            key = $5 ":" $6
+            seen[key] = 1
+          }}
+          END {{
+            count = 0
+            for (key in seen) {{
+              count++
+            }}
+            print count
+          }}
+        ' "${{scaffold_path}}"
+      )"
+    fi
+    scaffold_name="${{scaffold_path#${{FIVE_HCS_EXTRACTED_DIR}}/}}"
+    scaffold_name="$(echo "${{scaffold_name}}" | tr '/ ' '__')"
+    scaffold_name="${{scaffold_name%.gz}}"
+    scaffold_name="${{scaffold_name%.*}}.pdb"
+    printf '%s\t%s\t%s\n' "${{residue_count}}" "${{scaffold_name}}" "${{scaffold_path}}" >> "${{index_tmp}}"
+    indexed_count=$((indexed_count + 1))
+    if (( indexed_count % 1000 == 0 )); then
+      echo "Indexed ${{indexed_count}} scaffolds."
+    fi
+  done < <(
+    find "${{FIVE_HCS_EXTRACTED_DIR}}" \\
+      -type f \\
+      \\( -iname "*.pdb" -o -iname "*.pdb.gz" \\) \\
+      -print0
+  )
+  mv "${{index_tmp}}" "${{SCAFFOLD_INDEX}}"
+  echo "Indexed ${{indexed_count}} scaffold structure files."
+else
+  echo "Using cached 5HCS scaffold length index: ${{SCAFFOLD_INDEX}}"
+fi
+
 selected_count=0
 rejected_count=0
 processed_count=0
 
-while IFS= read -r -d '' scaffold_path; do
-  scaffold_name="${{scaffold_path#${{FIVE_HCS_EXTRACTED_DIR}}/}}"
-  scaffold_name="$(echo "${{scaffold_name}}" | tr '/ ' '__')"
-  scaffold_name="${{scaffold_name%.gz}}"
-  scaffold_name="${{scaffold_name%.*}}.pdb"
+while IFS=$'\t' read -r residue_count scaffold_name scaffold_path; do
+  if [[ -z "${{residue_count}}" || -z "${{scaffold_name}}" || -z "${{scaffold_path}}" ]]; then
+    continue
+  fi
+  processed_count=$((processed_count + 1))
+  if [[ "${{residue_count}}" -lt "${{MIN_SCAFFOLD_RESIDUES}}" || "${{residue_count}}" -gt "${{MAX_SCAFFOLD_RESIDUES}}" ]]; then
+    rejected_count=$((rejected_count + 1))
+    continue
+  fi
+
   scaffold_out="${{SCAFFOLD_PDB_DIR}}/${{scaffold_name}}"
+  if [[ -e "${{scaffold_out}}" || -L "${{scaffold_out}}" ]]; then
+    continue
+  fi
   lower_path="$(echo "${{scaffold_path}}" | tr '[:upper:]' '[:lower:]')"
   if [[ "${{lower_path}}" == *.gz ]]; then
     gzip -cd "${{scaffold_path}}" > "${{scaffold_out}}"
   else
-    cp -n "${{scaffold_path}}" "${{scaffold_out}}"
+    ln -s "${{scaffold_path}}" "${{scaffold_out}}"
   fi
-
-  residue_count="$(
-    awk '
-      $1 == "ATOM" && $3 == "CA" {{
-        key = $5 ":" $6
-        seen[key] = 1
-      }}
-      END {{
-        count = 0
-        for (key in seen) {{
-          count++
-        }}
-        print count
-      }}
-    ' "${{scaffold_out}}"
-  )"
-
-  if [[ "${{residue_count}}" -lt "${{MIN_SCAFFOLD_RESIDUES}}" || "${{residue_count}}" -gt "${{MAX_SCAFFOLD_RESIDUES}}" ]]; then
-    rm -f "${{scaffold_out}}"
-    rejected_count=$((rejected_count + 1))
-  else
-    selected_count=$((selected_count + 1))
-  fi
-  processed_count=$((processed_count + 1))
+  selected_count=$((selected_count + 1))
   if (( processed_count % 1000 == 0 )); then
     echo "Processed ${{processed_count}} scaffolds. Selected ${{selected_count}}, rejected ${{rejected_count}}."
   fi
-done < <(
-  find "${{FIVE_HCS_EXTRACTED_DIR}}" \\
-    -type f \\
-    \\( -iname "*.pdb" -o -iname "*.pdb.gz" -o -iname "*.cif" -o -iname "*.mmcif" -o -iname "*.cif.gz" -o -iname "*.mmcif.gz" \\) \\
-    -print0
-)
+done < "${{SCAFFOLD_INDEX}}"
 
 echo "Selected ${{selected_count}} scaffold structure files."
-if ! find "${{SCAFFOLD_PDB_DIR}}" -type f -name "*.pdb" -print -quit | grep -q .; then
+if ! find -L "${{SCAFFOLD_PDB_DIR}}" -type f -name "*.pdb" -print -quit | grep -q .; then
   echo "No 5HCS scaffold structure files passed the current scan and length filter." >&2
   exit 1
 fi
