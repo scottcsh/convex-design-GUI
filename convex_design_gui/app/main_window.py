@@ -4,11 +4,16 @@ import os
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
+import time
 import csv
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+if os.name == "posix":
+    import select
 
 from PySide6.QtCore import QObject, Qt, QThread, Signal
 from PySide6.QtWidgets import (
@@ -103,6 +108,7 @@ class ScriptRunWorker(QObject):
         self._cancel_requested = False
         self._seen_outputs = set()  # type: set
         self._output_size_cache = {}  # type: Dict[str, int]
+        self._expected_count_seen_at = None  # type: Optional[float]
 
     def request_cancel(self) -> None:
         self._cancel_requested = True
@@ -127,15 +133,10 @@ class ScriptRunWorker(QObject):
                 bufsize=1,
                 start_new_session=True,
             )
-            if self._process.stdout is not None:
-                for raw_line in self._process.stdout:
-                    line = raw_line.rstrip()
-                    if line:
-                        self.signals.log.emit(line)
-                    self._scan_outputs(status="Completed", force=False)
-                    if self._cancel_requested:
-                        break
-            return_code = self._process.wait()
+            completed_by_output = self._monitor_process_until_done()
+            return_code = self._wait_for_process()
+            if completed_by_output and return_code != 0:
+                return_code = 0
             self._scan_outputs(status="Completed", force=True)
             if self._cancel_requested:
                 self.signals.status.emit("cancelled")
@@ -151,6 +152,91 @@ class ScriptRunWorker(QObject):
             self.signals.output_count.emit(self._count_output_pdbs())
             self.signals.finished.emit(1)
 
+    def _monitor_process_until_done(self) -> bool:
+        completed_by_output = False
+        while self._process is not None:
+            self._read_available_output()
+            self._scan_outputs(status="Completed", force=False)
+            output_count = self._count_output_pdbs()
+            self.signals.output_count.emit(output_count)
+
+            if self._cancel_requested:
+                self._terminate_process()
+                break
+
+            if output_count >= self.expected_designs:
+                now = time.monotonic()
+                if self._expected_count_seen_at is None:
+                    self._expected_count_seen_at = now
+                elif now - self._expected_count_seen_at >= 2.0 and self._outputs_are_stable():
+                    completed_by_output = True
+                    self.signals.log.emit(
+                        f"[INFO] Expected output count reached ({output_count}/{self.expected_designs}). "
+                        "Stopping RFdiffusion shutdown wait and finalizing results."
+                    )
+                    self._scan_outputs(status="Completed", force=True)
+                    self._terminate_process()
+                    break
+            else:
+                self._expected_count_seen_at = None
+
+            if self._process.poll() is not None:
+                self._drain_remaining_output()
+                break
+
+            time.sleep(0.5)
+        return completed_by_output
+
+    def _read_available_output(self) -> None:
+        if self._process is None or self._process.stdout is None:
+            return
+        stdout = self._process.stdout
+        if os.name == "posix":
+            ready, _, _ = select.select([stdout], [], [], 0.2)
+            if not ready:
+                return
+        elif self._process.poll() is None:
+            return
+        raw_line = stdout.readline()
+        if raw_line:
+            line = raw_line.rstrip()
+            if line:
+                self.signals.log.emit(line)
+
+    def _drain_remaining_output(self) -> None:
+        if self._process is None or self._process.stdout is None:
+            return
+        for raw_line in self._process.stdout:
+            line = raw_line.rstrip()
+            if line:
+                self.signals.log.emit(line)
+
+    def _wait_for_process(self) -> int:
+        if self._process is None:
+            return 1
+        try:
+            return int(self._process.wait(timeout=10))
+        except subprocess.TimeoutExpired:
+            self._terminate_process(force=True)
+            return int(self._process.wait(timeout=10))
+
+    def _terminate_process(self, force: bool = False) -> None:
+        if self._process is None or self._process.poll() is not None:
+            return
+        try:
+            if os.name == "posix":
+                sig = signal.SIGKILL if force else signal.SIGTERM
+                os.killpg(os.getpgid(self._process.pid), sig)
+            elif force:
+                self._process.kill()
+            else:
+                self._process.terminate()
+        except Exception:
+            try:
+                self._process.kill() if force else self._process.terminate()
+            except Exception:
+                pass
+
     def _count_output_pdbs(self) -> int:
         if not self.output_dir.exists():
             return 0
@@ -164,6 +250,23 @@ class ScriptRunWorker(QObject):
             for path in self.output_dir.rglob("*.pdb")
             if path.is_file() and "traj" not in path.relative_to(self.output_dir).parts
         ]
+
+    def _outputs_are_stable(self) -> bool:
+        output_paths = sorted(self._iter_output_pdbs())
+        if not output_paths:
+            return False
+        stable_count = 0
+        for path in output_paths:
+            key = str(path)
+            try:
+                current_size = path.stat().st_size
+            except OSError:
+                return False
+            previous_size = self._output_size_cache.get(key)
+            if previous_size == current_size:
+                stable_count += 1
+            self._output_size_cache[key] = current_size
+        return stable_count >= min(len(output_paths), self.expected_designs)
 
     def _scan_outputs(self, status: str, force: bool = False) -> None:
         output_paths = sorted(self._iter_output_pdbs())
@@ -1370,7 +1473,27 @@ fi
         event.accept()
 
 
+def _ensure_writable_runtime_dir() -> None:
+    if os.name != "posix":
+        return
+    current_runtime_dir = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if current_runtime_dir:
+        current_path = Path(current_runtime_dir)
+        if current_path.is_dir() and os.access(str(current_path), os.W_OK):
+            return
+
+    user_name = os.environ.get("USER", "user")
+    fallback_path = Path("/tmp") / f"runtime-{user_name}-convex-design-gui"
+    try:
+        fallback_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fallback_path.chmod(0o700)
+        os.environ["XDG_RUNTIME_DIR"] = str(fallback_path)
+    except Exception:
+        pass
+
+
 def run() -> None:
+    _ensure_writable_runtime_dir()
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
