@@ -154,17 +154,24 @@ class ScriptRunWorker(QObject):
 
     def _monitor_process_until_done(self) -> bool:
         completed_by_output = False
+        output_count = 0
+        stable_count = 0
+        last_scan_at = 0.0
+        scan_interval = 1.0
         while self._process is not None:
-            self._read_available_output()
-            output_count, stable_count = self._scan_outputs(status="Completed", force=False)
-            self.signals.output_count.emit(output_count)
+            read_output = self._read_available_output()
+            now = time.monotonic()
+            process_done = self._process.poll() is not None
+            if process_done or now - last_scan_at >= scan_interval:
+                output_count, stable_count = self._scan_outputs(status="Completed", force=False)
+                self.signals.output_count.emit(output_count)
+                last_scan_at = now
 
             if self._cancel_requested:
                 self._terminate_process()
                 break
 
             if output_count >= self.expected_designs:
-                now = time.monotonic()
                 if self._expected_count_seen_at is None:
                     self._expected_count_seen_at = now
                 elif now - self._expected_count_seen_at >= 2.0 and stable_count >= self.expected_designs:
@@ -183,24 +190,37 @@ class ScriptRunWorker(QObject):
                 self._drain_remaining_output()
                 break
 
-            time.sleep(1.0)
+            if not read_output:
+                time.sleep(0.05)
         return completed_by_output
 
-    def _read_available_output(self) -> None:
+    def _read_available_output(self) -> bool:
         if self._process is None or self._process.stdout is None:
-            return
+            return False
         stdout = self._process.stdout
+        read_any = False
         if os.name == "posix":
-            ready, _, _ = select.select([stdout], [], [], 0.2)
-            if not ready:
-                return
+            while True:
+                ready, _, _ = select.select([stdout], [], [], 0)
+                if not ready:
+                    break
+                raw_line = stdout.readline()
+                if not raw_line:
+                    break
+                line = raw_line.rstrip()
+                if line:
+                    self.signals.log.emit(line)
+                    read_any = True
+            return read_any
         elif self._process.poll() is None:
-            return
+            return False
         raw_line = stdout.readline()
         if raw_line:
             line = raw_line.rstrip()
             if line:
                 self.signals.log.emit(line)
+                read_any = True
+        return read_any
 
     def _drain_remaining_output(self) -> None:
         if self._process is None or self._process.stdout is None:
