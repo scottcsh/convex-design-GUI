@@ -156,8 +156,7 @@ class ScriptRunWorker(QObject):
         completed_by_output = False
         while self._process is not None:
             self._read_available_output()
-            self._scan_outputs(status="Completed", force=False)
-            output_count = self._count_output_pdbs()
+            output_count, stable_count = self._scan_outputs(status="Completed", force=False)
             self.signals.output_count.emit(output_count)
 
             if self._cancel_requested:
@@ -168,7 +167,7 @@ class ScriptRunWorker(QObject):
                 now = time.monotonic()
                 if self._expected_count_seen_at is None:
                     self._expected_count_seen_at = now
-                elif now - self._expected_count_seen_at >= 2.0 and self._outputs_are_stable():
+                elif now - self._expected_count_seen_at >= 2.0 and stable_count >= self.expected_designs:
                     completed_by_output = True
                     self.signals.log.emit(
                         f"[INFO] Expected output count reached ({output_count}/{self.expected_designs}). "
@@ -184,7 +183,7 @@ class ScriptRunWorker(QObject):
                 self._drain_remaining_output()
                 break
 
-            time.sleep(0.5)
+            time.sleep(1.0)
         return completed_by_output
 
     def _read_available_output(self) -> None:
@@ -251,36 +250,25 @@ class ScriptRunWorker(QObject):
             if path.is_file() and "traj" not in path.relative_to(self.output_dir).parts
         ]
 
-    def _outputs_are_stable(self) -> bool:
+    def _scan_outputs(self, status: str, force: bool = False) -> Tuple[int, int]:
         output_paths = sorted(self._iter_output_pdbs())
-        if not output_paths:
-            return False
         stable_count = 0
         for path in output_paths:
             key = str(path)
+
             try:
                 current_size = path.stat().st_size
             except OSError:
-                return False
+                continue
             previous_size = self._output_size_cache.get(key)
-            if previous_size == current_size:
-                stable_count += 1
             self._output_size_cache[key] = current_size
-        return stable_count >= min(len(output_paths), self.expected_designs)
+            is_stable = previous_size == current_size
+            if is_stable:
+                stable_count += 1
 
-    def _scan_outputs(self, status: str, force: bool = False) -> None:
-        output_paths = sorted(self._iter_output_pdbs())
-        for path in output_paths:
-            key = str(path)
             if key in self._seen_outputs:
                 continue
 
-            try:
-                current_size = path.stat().st_size
-            except OSError:
-                continue
-            previous_size = self._output_size_cache.get(key)
-            self._output_size_cache[key] = current_size
             if not force and previous_size != current_size:
                 continue
 
@@ -301,6 +289,7 @@ class ScriptRunWorker(QObject):
             )
         progress = int(min(100, round((len(output_paths) / self.expected_designs) * 100)))
         self.signals.progress.emit(progress)
+        return len(output_paths), stable_count
 
 
 def load_settings() -> Dict[str, str]:
