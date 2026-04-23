@@ -84,6 +84,28 @@ OUTPUT_HEADER_LABELS = {
     "length": "Len",
     "status": "Status",
 }
+AA3_TO_1 = {
+    "ALA": "A",
+    "ARG": "R",
+    "ASN": "N",
+    "ASP": "D",
+    "CYS": "C",
+    "GLN": "Q",
+    "GLU": "E",
+    "GLY": "G",
+    "HIS": "H",
+    "ILE": "I",
+    "LEU": "L",
+    "LYS": "K",
+    "MET": "M",
+    "PHE": "F",
+    "PRO": "P",
+    "SER": "S",
+    "THR": "T",
+    "TRP": "W",
+    "TYR": "Y",
+    "VAL": "V",
+}
 
 
 class RunSignals(QObject):
@@ -97,12 +119,22 @@ class RunSignals(QObject):
 
 
 class ScriptRunWorker(QObject):
-    def __init__(self, script_path: Path, output_dir: Path, expected_designs: int, target_chain: str) -> None:
+    def __init__(
+        self,
+        script_path: Path,
+        output_dir: Path,
+        expected_designs: int,
+        target_chain: str,
+        target_sequence: str,
+        target_length: int,
+    ) -> None:
         super().__init__()
         self.script_path = script_path
         self.output_dir = output_dir
         self.expected_designs = max(1, int(expected_designs))
         self.target_chain = target_chain
+        self.target_sequence = target_sequence
+        self.target_length = target_length
         self.signals = RunSignals()
         self._process = None  # type: Optional[subprocess.Popen]
         self._cancel_requested = False
@@ -292,7 +324,12 @@ class ScriptRunWorker(QObject):
             if not force and previous_size != current_size:
                 continue
 
-            metrics = calculate_output_pdb_metrics(path, self.target_chain)
+            metrics = calculate_output_pdb_metrics(
+                path,
+                self.target_chain,
+                target_sequence=self.target_sequence,
+                target_length=self.target_length,
+            )
             metrics_ready = bool(metrics.get("sphere convexity") not in ("", None) and metrics.get("length") not in ("", None))
             if not metrics_ready and not force:
                 continue
@@ -303,6 +340,8 @@ class ScriptRunWorker(QObject):
                     "pdb file": path.name,
                     "sphere convexity": metrics.get("sphere convexity", ""),
                     "length": metrics.get("length", ""),
+                    "target chain": metrics.get("target chain", ""),
+                    "binder chain": metrics.get("binder chain", ""),
                     "path": str(path),
                     "status": status,
                 }
@@ -399,17 +438,28 @@ def _calculate_signed_convexity_from_interface(
     }
 
 
-def calculate_output_pdb_metrics(output_pdb: Path, target_chain: str) -> Dict[str, object]:
+def calculate_output_pdb_metrics(
+    output_pdb: Path,
+    target_chain: str,
+    target_sequence: str = "",
+    target_length: int = 0,
+) -> Dict[str, object]:
     try:
         structure = _load_structure(output_pdb)
         model = structure[0]
-        if target_chain not in model:
-            return {"sphere convexity": "", "length": ""}
+        target = _select_output_target_chain(
+            model=model,
+            preferred_chain_id=target_chain,
+            target_sequence=target_sequence,
+            target_length=target_length,
+        )
+        if target is None:
+            return {"sphere convexity": "", "length": "", "target chain": "", "binder chain": ""}
 
-        target_coords = _collect_heavy_atom_coords(model[target_chain], residue_numbers=set())
-        candidate_chains = [chain for chain in model if chain.id != target_chain]
+        target_coords = _collect_heavy_atom_coords(target, residue_numbers=set())
+        candidate_chains = [chain for chain in model if chain.id != target.id]
         if not candidate_chains or not target_coords:
-            return {"sphere convexity": "", "length": ""}
+            return {"sphere convexity": "", "length": "", "target chain": target.id, "binder chain": ""}
 
         chain = max(candidate_chains, key=lambda candidate: len(_collect_heavy_atom_coords(candidate, residue_numbers=set())))
         binder_coords = _collect_heavy_atom_coords(chain, residue_numbers=set())
@@ -429,9 +479,47 @@ def calculate_output_pdb_metrics(output_pdb: Path, target_chain: str) -> Dict[st
         return {
             "sphere convexity": metrics.get("sphere convexity", ""),
             "length": len(residue_numbers),
+            "target chain": target.id,
+            "binder chain": chain.id,
         }
     except Exception:
-        return {"sphere convexity": "", "length": ""}
+        return {"sphere convexity": "", "length": "", "target chain": "", "binder chain": ""}
+
+
+def _select_output_target_chain(
+    model,
+    preferred_chain_id: str,
+    target_sequence: str,
+    target_length: int,
+):
+    chains = [chain for chain in model if _count_chain_residues(chain) > 0]
+    if not chains:
+        return None
+
+    if target_sequence:
+        return max(
+            chains,
+            key=lambda chain: (
+                _sequence_similarity(_chain_sequence(chain), target_sequence),
+                -abs(_count_chain_residues(chain) - len(target_sequence)),
+            ),
+        )
+
+    if preferred_chain_id in model:
+        return model[preferred_chain_id]
+
+    if target_length > 0:
+        return min(chains, key=lambda chain: abs(_count_chain_residues(chain) - target_length))
+    return chains[0]
+
+
+def _sequence_similarity(first: str, second: str) -> float:
+    if not first or not second:
+        return 0.0
+    length = min(len(first), len(second))
+    matches = sum(1 for index in range(length) if first[index] == second[index])
+    length_penalty = abs(len(first) - len(second)) / max(len(first), len(second), 1)
+    return (matches / length) - length_penalty
 
 
 def _load_structure(input_pdb: Path):
@@ -443,6 +531,29 @@ def _load_structure(input_pdb: Path):
     else:
         raise ValueError(f"Unsupported structure format: {input_pdb.suffix}")
     return parser.get_structure(input_pdb.stem, str(input_pdb))
+
+
+def _chain_signature(input_pdb: Path, chain_id: str) -> Tuple[int, str]:
+    structure = _load_structure(input_pdb)
+    model = structure[0]
+    if chain_id not in model:
+        available = ", ".join(chain.id for chain in model)
+        raise ValueError(f"Chain '{chain_id}' was not found in {input_pdb.name}. Available chains: {available or '(none)'}")
+    chain = model[chain_id]
+    return _count_chain_residues(chain), _chain_sequence(chain)
+
+
+def _count_chain_residues(chain) -> int:
+    return sum(1 for residue in chain if residue.id[0] == " " and is_aa(residue, standard=False) and "CA" in residue)
+
+
+def _chain_sequence(chain) -> str:
+    letters = []
+    for residue in chain:
+        if residue.id[0] != " " or not is_aa(residue, standard=False) or "CA" not in residue:
+            continue
+        letters.append(AA3_TO_1.get(residue.get_resname().upper(), "X"))
+    return "".join(letters)
 
 
 class _SingleChainSelect(Select):
@@ -1033,6 +1144,7 @@ class MainWindow(QMainWindow):
                 hotspot_residues=hotspots,
             )
             _write_target_chain_pdb(input_pdb, target_chain, target_only_pdb)
+            target_length, target_sequence = _chain_signature(input_pdb, target_chain)
         except Exception as exc:
             QMessageBox.critical(self, "Input Processing Error", str(exc))
             return
@@ -1095,6 +1207,9 @@ class MainWindow(QMainWindow):
             script_path,
             script_dir / f"{input_pdb.stem}_5hcs_rfd" / "rfd_result",
             num_designs,
+            target_chain,
+            target_sequence,
+            target_length,
         )
 
     def _format_metric(self, value: object) -> str:
@@ -1305,11 +1420,26 @@ fi
             item.setText(status)
             item.setToolTip(status)
 
-    def _start_script_run(self, script_path: Path, output_dir: Path, expected_designs: int) -> None:
+    def _start_script_run(
+        self,
+        script_path: Path,
+        output_dir: Path,
+        expected_designs: int,
+        target_chain: str,
+        target_sequence: str,
+        target_length: int,
+    ) -> None:
         self.generate_btn.setEnabled(False)
         self._set_output_status("running")
         self.run_thread = QThread(self)
-        self.run_worker = ScriptRunWorker(script_path, output_dir, expected_designs, self._get_target_chain())
+        self.run_worker = ScriptRunWorker(
+            script_path,
+            output_dir,
+            expected_designs,
+            target_chain,
+            target_sequence,
+            target_length,
+        )
         self.run_worker.moveToThread(self.run_thread)
 
         self.run_thread.started.connect(self.run_worker.run)
